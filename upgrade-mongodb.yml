@@ -1,0 +1,259 @@
+---
+# PHASE 3 - MongoDB 6.0 to 7.0 Rolling Upgrade
+
+- name: Preflight - Verify Replica Set
+  hosts: mongo1
+  gather_facts: false
+  tasks:
+    - name: Verify all 5 members and FCV 6.0
+      ansible.builtin.command:
+        argv:
+          - mongosh
+          - --quiet
+          - --eval
+          - |
+            const s = rs.status();
+            const fcv = db.adminCommand({getParameter: 1, featureCompatibilityVersion: 1});
+            if (s.members.length !== 5 ||
+                s.members.filter(m => m.stateStr === "PRIMARY").length !== 1 ||
+                s.members.filter(m => m.stateStr === "SECONDARY").length !== 4 ||
+                fcv.featureCompatibilityVersion.version !== "6.0") {
+              throw new Error("Replica Set unhealthy or FCV is not 6.0");
+            }
+            if (!db.hello().isWritablePrimary) {
+              throw new Error("mongo1 is not the initial PRIMARY");
+            }
+            print("PREFLIGHT PASS");
+      changed_when: false
+
+- name: Upgrade SECONDARY nodes one by one
+  hosts: mongodb
+  order: inventory
+  serial: 1
+  become: true
+  gather_facts: false
+
+  tasks:
+    - name: Upgrade current SECONDARY
+      when: inventory_hostname != 'mongo1'
+      block:
+        - name: Verify node is SECONDARY
+          ansible.builtin.command:
+            argv:
+              - mongosh
+              - --quiet
+              - --eval
+              - |
+                if (!db.hello().secondary) {
+                  throw new Error("Node is not SECONDARY");
+                }
+                print("SECONDARY PASS");
+          changed_when: false
+
+        - name: Download MongoDB 7.0 GPG key
+          ansible.builtin.get_url:
+            url: https://pgp.mongodb.com/server-7.0.asc
+            dest: /tmp/mongodb-server-7.0.asc
+            mode: '0644'
+
+        - name: Import MongoDB 7.0 GPG key
+          ansible.builtin.command:
+            cmd: gpg --dearmor -o /usr/share/keyrings/mongodb-server-7.0.gpg /tmp/mongodb-server-7.0.asc
+            creates: /usr/share/keyrings/mongodb-server-7.0.gpg
+
+        - name: Add MongoDB 7.0 repository
+          ansible.builtin.apt_repository:
+            repo: "deb [arch=amd64 signed-by=/usr/share/keyrings/mongodb-server-7.0.gpg] https://repo.mongodb.org/apt/ubuntu jammy/mongodb-org/7.0 multiverse"
+            filename: mongodb-org-7.0
+            state: present
+            update_cache: true
+
+        - name: Stop MongoDB
+          ansible.builtin.systemd:
+            name: mongod
+            state: stopped
+
+        - name: Upgrade MongoDB packages to 7.0
+          ansible.builtin.apt:
+            name:
+              - mongodb-org=7.0.*
+              - mongodb-org-database=7.0.*
+              - mongodb-org-server=7.0.*
+              - mongodb-org-mongos=7.0.*
+              - mongodb-org-shell=7.0.*
+              - mongodb-org-tools=7.0.*
+            state: present
+            allow_change_held_packages: true
+            update_cache: true
+
+        - name: Start MongoDB
+          ansible.builtin.systemd:
+            name: mongod
+            state: started
+            enabled: true
+
+        - name: Wait for MongoDB port
+          ansible.builtin.wait_for:
+            host: 127.0.0.1
+            port: 27017
+            timeout: 120
+
+        - name: Verify MongoDB 7.0 and SECONDARY state
+          ansible.builtin.command:
+            argv:
+              - mongosh
+              - --quiet
+              - --eval
+              - |
+                const v = db.version();
+                const h = db.hello();
+                if (!v.startsWith("7.0.") || !h.secondary) {
+                  throw new Error("Upgrade verification failed: " + v);
+                }
+                print("PASS | " + v + " | SECONDARY");
+          register: secondary_check
+          retries: 30
+          delay: 10
+          until: secondary_check.rc == 0
+          changed_when: false
+
+        - name: Show SECONDARY upgrade result
+          ansible.builtin.debug:
+            var: secondary_check.stdout
+
+- name: Step down old PRIMARY
+  hosts: mongo1
+  gather_facts: false
+
+  tasks:
+    - name: Request PRIMARY stepdown
+      ansible.builtin.command:
+        argv:
+          - mongosh
+          - --quiet
+          - --eval
+          - |
+            try {
+              rs.stepDown(120, 30);
+            } catch (e) {
+              print("Stepdown requested: " + e.message);
+            }
+      register: stepdown_result
+      changed_when: true
+      failed_when: false
+
+    - name: Verify mongo1 is now SECONDARY
+      ansible.builtin.command:
+        argv:
+          - mongosh
+          - --quiet
+          - --eval
+          - |
+            if (!db.hello().secondary) {
+              throw new Error("Waiting for mongo1 to become SECONDARY");
+            }
+            print("mongo1 is SECONDARY");
+      register: old_primary_check
+      retries: 30
+      delay: 5
+      until: old_primary_check.rc == 0
+      changed_when: false
+
+- name: Upgrade old PRIMARY last
+  hosts: mongo1
+  become: true
+  gather_facts: false
+
+  tasks:
+    - name: Download MongoDB 7.0 GPG key
+      ansible.builtin.get_url:
+        url: https://pgp.mongodb.com/server-7.0.asc
+        dest: /tmp/mongodb-server-7.0.asc
+        mode: '0644'
+
+    - name: Import MongoDB 7.0 GPG key
+      ansible.builtin.command:
+        cmd: gpg --dearmor -o /usr/share/keyrings/mongodb-server-7.0.gpg /tmp/mongodb-server-7.0.asc
+        creates: /usr/share/keyrings/mongodb-server-7.0.gpg
+
+    - name: Add MongoDB 7.0 repository
+      ansible.builtin.apt_repository:
+        repo: "deb [arch=amd64 signed-by=/usr/share/keyrings/mongodb-server-7.0.gpg] https://repo.mongodb.org/apt/ubuntu jammy/mongodb-org/7.0 multiverse"
+        filename: mongodb-org-7.0
+        state: present
+        update_cache: true
+
+    - name: Stop old PRIMARY
+      ansible.builtin.systemd:
+        name: mongod
+        state: stopped
+
+    - name: Upgrade old PRIMARY to MongoDB 7.0
+      ansible.builtin.apt:
+        name:
+          - mongodb-org=7.0.*
+          - mongodb-org-database=7.0.*
+          - mongodb-org-server=7.0.*
+          - mongodb-org-mongos=7.0.*
+          - mongodb-org-shell=7.0.*
+          - mongodb-org-tools=7.0.*
+        state: present
+        allow_change_held_packages: true
+        update_cache: true
+
+    - name: Start old PRIMARY
+      ansible.builtin.systemd:
+        name: mongod
+        state: started
+        enabled: true
+
+    - name: Verify mongo1 upgraded and rejoined
+      ansible.builtin.command:
+        argv:
+          - mongosh
+          - --quiet
+          - --eval
+          - |
+            const v = db.version();
+            const h = db.hello();
+            if (!v.startsWith("7.0.") ||
+                !(h.secondary || h.isWritablePrimary)) {
+              throw new Error("mongo1 not ready");
+            }
+            print("mongo1 | " + v + " | PASS");
+      register: final_node_check
+      retries: 30
+      delay: 10
+      until: final_node_check.rc == 0
+      changed_when: false
+
+- name: Final verification on all 5 nodes
+  hosts: mongodb
+  gather_facts: false
+
+  tasks:
+    - name: Verify MongoDB 7.0 and replica membership
+      ansible.builtin.command:
+        argv:
+          - mongosh
+          - --quiet
+          - --eval
+          - |
+            const v = db.version();
+            const h = db.hello();
+            if (!v.startsWith("7.0.") ||
+                !(h.secondary || h.isWritablePrimary)) {
+              throw new Error("Final verification failed");
+            }
+            print(v + " | " +
+              (h.isWritablePrimary ? "PRIMARY" : "SECONDARY") +
+              " | PASS");
+      register: final_check
+      retries: 30
+      delay: 10
+      until: final_check.rc == 0
+      changed_when: false
+
+    - name: Show final result
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }} | {{ final_check.stdout }}"

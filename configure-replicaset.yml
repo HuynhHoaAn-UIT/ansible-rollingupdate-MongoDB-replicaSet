@@ -1,0 +1,99 @@
+---
+- name: Configure MongoDB 5-Node Replica Set
+  hosts: mongodb
+  become: true
+  vars:
+    repl_set_name: "rs0"
+
+  tasks:
+    # 1. Cho phep MongoDB lang nghe tren localhost va Private IP
+    - name: Allow private network connections
+      ansible.builtin.lineinfile:
+        path: /etc/mongod.conf
+        regexp: '^\s*bindIp:'
+        line: '  bindIp: 127.0.0.1,{{ mongo_private_ip }}'
+      notify: Restart mongod
+
+    # 2. Cau hinh Replica Set rs0
+    - name: Enable replication in mongod.conf
+      ansible.builtin.blockinfile:
+        path: /etc/mongod.conf
+        marker: "# {mark} ANSIBLE REPLICATION"
+        block: |
+          replication:
+            replSetName: "{{ repl_set_name }}"
+      notify: Restart mongod
+
+    # 3. Restart mongod truoc khi khoi tao Replica Set
+    - name: Flush handlers to restart mongod immediately
+      ansible.builtin.meta: flush_handlers
+
+    # 4. Khoi tao Replica Set tren mongo1
+    - name: Initialize MongoDB Replica Set
+      ansible.builtin.command:
+        argv:
+          - mongosh
+          - --quiet
+          - --eval
+          - |
+            const config = {
+              _id: "{{ repl_set_name }}",
+              members: [
+                {% for host in groups['mongodb'] %}
+                {
+                  _id: {{ loop.index0 }},
+                  host: "{{ hostvars[host]['mongo_private_ip'] }}:27017",
+                  priority: {{ 2 if host == 'mongo1' else 1 }}
+                }{{ ',' if not loop.last else '' }}
+                {% endfor %}
+              ]
+            };
+            if (!db.adminCommand({hello: 1}).setName) {
+              printjson(rs.initiate(config));
+            } else {
+              print("Replica Set already initialized");
+            }
+      run_once: true
+      delegate_to: mongo1
+      register: rs_init
+      changed_when: "'already initialized' not in rs_init.stdout"
+
+    # 5. Hien thi ket qua khoi tao
+    - name: Show initialization result
+      ansible.builtin.debug:
+        var: rs_init.stdout
+      run_once: true
+
+    # 6. Kiem tra Replica Set
+    - name: Check Replica Set status
+      ansible.builtin.command:
+        argv:
+          - mongosh
+          - --quiet
+          - --eval
+          - |
+            const s = rs.status();
+            printjson(s.members.map(m => ({
+              name: m.name,
+              state: m.stateStr
+            })));
+      delegate_to: mongo1
+      run_once: true
+      register: rs_status
+      changed_when: false
+      retries: 12
+      delay: 5
+      until: rs_status.rc == 0 and
+             "'PRIMARY' in rs_status.stdout" and
+             (rs_status.stdout | regex_findall('SECONDARY') | length == 4)
+
+    - name: Show Replica Set status
+      ansible.builtin.debug:
+        var: rs_status.stdout
+      run_once: true
+
+  handlers:
+    - name: Restart mongod
+      ansible.builtin.service:
+        name: mongod
+        state: restarted
