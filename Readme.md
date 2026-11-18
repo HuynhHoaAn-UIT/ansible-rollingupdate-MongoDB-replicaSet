@@ -21,5 +21,8 @@ Cấu hình Replica Set rs0 với 1 PRIMARY (mongo1) và 4 SECONDARY, sử dụn
 Playbook: upgrade-mongodb.yml
 
 Nâng cấp lần lượt 4 SECONDARY trước, sau đó rs.stepDown() để chuyển PRIMARY và nâng cấp mongo1 cuối cùng. Kết quả: 5/5 node chạy MongoDB 7.0.48, failed=0.
+<img width="940" height="716" alt="Screenshot 2026-11-18 141353" src="https://github.com/user-attachments/assets/290b5954-fe30-4eff-a146-7cba45dc1c39" />
+
+
 
 
